@@ -6,15 +6,16 @@
 from __future__ import division
 import json
 import os
-import unittest
 import pickle
+import unittest
 
 import requests
 import pytest
-from requests.auth import HTTPDigestAuth
 from requests.adapters import HTTPAdapter
-from requests.compat import str, cookielib, getproxies, urljoin, urlparse
-from requests.cookies import cookiejar_from_dict
+from requests.auth import HTTPDigestAuth
+from requests.compat import (
+    Morsel, cookielib, getproxies, str, urljoin, urlparse)
+from requests.cookies import cookiejar_from_dict, morsel_to_cookie
 from requests.exceptions import InvalidURL, MissingSchema
 from requests.structures import CaseInsensitiveDict
 
@@ -165,7 +166,7 @@ class RequestsTestCase(unittest.TestCase):
 
     def test_cookie_persists_via_api(self):
         s = requests.session()
-        r = s.get(httpbin('redirect/1'), cookies={'foo':'bar'})
+        r = s.get(httpbin('redirect/1'), cookies={'foo': 'bar'})
         assert 'foo' in r.request.headers['Cookie']
         assert 'foo' in r.history[0].request.headers['Cookie']
 
@@ -177,6 +178,12 @@ class RequestsTestCase(unittest.TestCase):
         # Session cookie should not be modified
         assert s.cookies['foo'] == 'bar'
 
+    def test_request_cookies_not_persisted(self):
+        s = requests.session()
+        s.get(httpbin('cookies'), cookies={'foo': 'baz'})
+        # Sending a request with cookies should not add cookies to the session
+        assert not s.cookies
+
     def test_generic_cookiejar_works(self):
         cj = cookielib.CookieJar()
         cookiejar_from_dict({'foo': 'bar'}, cj)
@@ -187,6 +194,14 @@ class RequestsTestCase(unittest.TestCase):
         assert r.json()['cookies']['foo'] == 'bar'
         # Make sure the session cj is still the custom one
         assert s.cookies is cj
+
+    def test_param_cookiejar_works(self):
+        cj = cookielib.CookieJar()
+        cookiejar_from_dict({'foo' : 'bar'}, cj)
+        s = requests.session()
+        r = s.get(httpbin('cookies'), cookies=cj)
+        # Make sure the cookie was sent
+        assert r.json()['cookies']['foo'] == 'bar'
 
     def test_requests_in_history_are_not_overridden(self):
         resp = requests.get(httpbin('redirect/3'))
@@ -320,6 +335,14 @@ class RequestsTestCase(unittest.TestCase):
         r = s.get(url)
         assert r.status_code == 401
 
+    def test_DIGESTAUTH_QUOTES_QOP_VALUE(self):
+
+        auth = HTTPDigestAuth('user', 'pass')
+        url = httpbin('digest-auth', 'auth', 'user', 'pass')
+
+        r = requests.get(url, auth=auth)
+        assert '"auth"' in r.request.headers['Authorization']
+
     def test_POSTBIN_GET_POST_FILES(self):
 
         url = httpbin('post')
@@ -433,7 +456,7 @@ class RequestsTestCase(unittest.TestCase):
         prep = r.prepare()
         assert b'name="stuff"' in prep.body
         assert b'name="b\'stuff\'"' not in prep.body
-    
+
     def test_unicode_method_name(self):
         files = {'file': open('test_requests.py', 'rb')}
         r = requests.request(method=u'POST', url=httpbin('post'), files=files)
@@ -454,6 +477,25 @@ class RequestsTestCase(unittest.TestCase):
             assert kwargs != {}
 
         requests.Request('GET', HTTPBIN, hooks={'response': hook})
+
+    def test_session_hooks_are_used_with_no_request_hooks(self):
+        hook = lambda x, *args, **kwargs: x
+        s = requests.Session()
+        s.hooks['response'].append(hook)
+        r = requests.Request('GET', HTTPBIN)
+        prep = s.prepare_request(r)
+        assert prep.hooks['response'] != []
+        assert prep.hooks['response'] == [hook]
+
+    def test_session_hooks_are_overriden_by_request_hooks(self):
+        hook1 = lambda x, *args, **kwargs: x
+        hook2 = lambda x, *args, **kwargs: x
+        assert hook1 is not hook2
+        s = requests.Session()
+        s.hooks['response'].append(hook2)
+        r = requests.Request('GET', HTTPBIN, hooks={'response': [hook1]})
+        prep = s.prepare_request(r)
+        assert prep.hooks['response'] == [hook1]
 
     def test_prepared_request_hook(self):
         def hook(resp, **kwargs):
@@ -528,6 +570,94 @@ class RequestsTestCase(unittest.TestCase):
         assert cookie.domain == domain
         assert cookie._rest['HttpOnly'] == rest['HttpOnly']
 
+    def test_cookie_as_dict_keeps_len(self):
+        key = 'some_cookie'
+        value = 'some_value'
+
+        key1 = 'some_cookie1'
+        value1 = 'some_value1'
+
+        jar = requests.cookies.RequestsCookieJar()
+        jar.set(key, value)
+        jar.set(key1, value1)
+
+        d1 = dict(jar)
+        d2 = dict(jar.iteritems())
+        d3 = dict(jar.items())
+
+        assert len(jar) == 2
+        assert len(d1) == 2
+        assert len(d2) == 2
+        assert len(d3) == 2
+
+    def test_cookie_as_dict_keeps_items(self):
+        key = 'some_cookie'
+        value = 'some_value'
+
+        key1 = 'some_cookie1'
+        value1 = 'some_value1'
+
+        jar = requests.cookies.RequestsCookieJar()
+        jar.set(key, value)
+        jar.set(key1, value1)
+
+        d1 = dict(jar)
+        d2 = dict(jar.iteritems())
+        d3 = dict(jar.items())
+
+        assert d1['some_cookie'] == 'some_value'
+        assert d2['some_cookie'] == 'some_value'
+        assert d3['some_cookie1'] == 'some_value1'
+
+    def test_cookie_as_dict_keys(self):
+        key = 'some_cookie'
+        value = 'some_value'
+
+        key1 = 'some_cookie1'
+        value1 = 'some_value1'
+
+        jar = requests.cookies.RequestsCookieJar()
+        jar.set(key, value)
+        jar.set(key1, value1)
+
+        keys = jar.keys()
+        assert keys == list(keys)
+        # make sure one can use keys multiple times
+        assert list(keys) == list(keys)
+
+    def test_cookie_as_dict_values(self):
+        key = 'some_cookie'
+        value = 'some_value'
+
+        key1 = 'some_cookie1'
+        value1 = 'some_value1'
+
+        jar = requests.cookies.RequestsCookieJar()
+        jar.set(key, value)
+        jar.set(key1, value1)
+
+        values = jar.values()
+        assert values == list(values)
+        # make sure one can use values multiple times
+        assert list(values) == list(values)
+
+    def test_cookie_as_dict_items(self):
+        key = 'some_cookie'
+        value = 'some_value'
+
+        key1 = 'some_cookie1'
+        value1 = 'some_value1'
+
+        jar = requests.cookies.RequestsCookieJar()
+        jar.set(key, value)
+        jar.set(key1, value1)
+
+        items = jar.items()
+        assert items == list(items)
+        # make sure one can use items multiple times
+        assert list(items) == list(items)
+
+
     def test_time_elapsed_blank(self):
         r = requests.get(httpbin('get'))
         td = r.elapsed
@@ -547,9 +677,37 @@ class RequestsTestCase(unittest.TestCase):
         assert next(iter(r))
         io.close()
 
+    def test_request_and_response_are_pickleable(self):
+        r = requests.get(httpbin('get'))
+
+        # verify we can pickle the original request
+        assert pickle.loads(pickle.dumps(r.request))
+
+        # verify we can pickle the response and that we have access to
+        # the original request.
+        pr = pickle.loads(pickle.dumps(r))
+        assert r.request.url == pr.request.url
+        assert r.request.headers == pr.request.headers
+
     def test_get_auth_from_url(self):
         url = 'http://user:pass@complex.url.com/path?query=yes'
         assert ('user', 'pass') == requests.utils.get_auth_from_url(url)
+
+    def test_get_auth_from_url_encoded_spaces(self):
+        url = 'http://user:pass%20pass@complex.url.com/path?query=yes'
+        assert ('user', 'pass pass') == requests.utils.get_auth_from_url(url)
+
+    def test_get_auth_from_url_not_encoded_spaces(self):
+        url = 'http://user:pass pass@complex.url.com/path?query=yes'
+        assert ('user', 'pass pass') == requests.utils.get_auth_from_url(url)
+
+    def test_get_auth_from_url_percent_chars(self):
+        url = 'http://user%25user:pass@complex.url.com/path?query=yes'
+        assert ('user%user', 'pass') == requests.utils.get_auth_from_url(url)
+
+    def test_get_auth_from_url_encoded_hashes(self):
+        url = 'http://user:pass%23pass@complex.url.com/path?query=yes'
+        assert ('user', 'pass#pass') == requests.utils.get_auth_from_url(url)
 
     def test_cannot_send_unprepared_requests(self):
         r = requests.Request(url=HTTPBIN)
@@ -682,6 +840,18 @@ class RequestsTestCase(unittest.TestCase):
         p = req.prepare()
 
         assert p.headers['Content-Length'] == length
+
+    def test_oddball_schemes_dont_check_URLs(self):
+        test_urls = (
+            'data:image/gif;base64,R0lGODlhAQABAHAAACH5BAUAAAAALAAAAAABAAEAAAICRAEAOw==',
+            'file:///etc/passwd',
+            'magnet:?xt=urn:btih:be08f00302bc2d1d3cfa3af02024fa647a271431',
+        )
+        for test_url in test_urls:
+            req = requests.Request('GET', test_url)
+            preq = req.prepare()
+            assert test_url == preq.url
+
 
 class TestContentEncodingDetection(unittest.TestCase):
 
@@ -885,6 +1055,116 @@ class UtilsTestCase(unittest.TestCase):
             pass
         else:
             assert super_len(cStringIO.StringIO('but some how, some way...')) == 25
+
+    def test_get_environ_proxies_ip_ranges(self):
+        """ Ensures that IP addresses are correctly matches with ranges in no_proxy variable """
+        from requests.utils import get_environ_proxies
+        os.environ['no_proxy'] = "192.168.0.0/24,127.0.0.1,localhost.localdomain,172.16.1.1"
+        assert get_environ_proxies('http://192.168.0.1:5000/') == {}
+        assert get_environ_proxies('http://192.168.0.1/') == {}
+        assert get_environ_proxies('http://172.16.1.1/') == {}
+        assert get_environ_proxies('http://172.16.1.1:5000/') == {}
+        assert get_environ_proxies('http://192.168.1.1:5000/') != {}
+        assert get_environ_proxies('http://192.168.1.1/') != {}
+
+    def test_get_environ_proxies(self):
+        """ Ensures that IP addresses are correctly matches with ranges in no_proxy variable """
+        from requests.utils import get_environ_proxies
+        os.environ['no_proxy'] = "127.0.0.1,localhost.localdomain,192.168.0.0/24,172.16.1.1"
+        assert get_environ_proxies('http://localhost.localdomain:5000/v1.0/') == {}
+        assert get_environ_proxies('http://www.requests.com/') != {}
+
+    def test_is_ipv4_address(self):
+        from requests.utils import is_ipv4_address
+        assert is_ipv4_address('8.8.8.8')
+        assert not is_ipv4_address('8.8.8.8.8')
+        assert not is_ipv4_address('localhost.localdomain')
+
+    def test_is_valid_cidr(self):
+        from requests.utils import is_valid_cidr
+        assert not is_valid_cidr('8.8.8.8')
+        assert is_valid_cidr('192.168.1.0/24')
+
+    def test_dotted_netmask(self):
+        from requests.utils import dotted_netmask
+        assert dotted_netmask(8) == '255.0.0.0'
+        assert dotted_netmask(24) == '255.255.255.0'
+        assert dotted_netmask(25) == '255.255.255.128'
+
+    def test_address_in_network(self):
+        from requests.utils import address_in_network
+        assert address_in_network('192.168.1.1', '192.168.1.0/24')
+        assert not address_in_network('172.16.0.1', '192.168.1.0/24')
+
+    def test_get_auth_from_url(self):
+        """ Ensures that username and password in well-encoded URI as per RFC 3986 are correclty extracted """
+        from requests.utils import get_auth_from_url
+        from requests.compat import quote
+        percent_encoding_test_chars = "%!*'();:@&=+$,/?#[] "
+        url_address = "request.com/url.html#test"
+        url = "http://" + quote(percent_encoding_test_chars, '') + ':' + quote(percent_encoding_test_chars, '') + '@' + url_address
+        (username, password) = get_auth_from_url(url)
+        assert username == percent_encoding_test_chars
+        assert password == percent_encoding_test_chars
+
+
+class TestMorselToCookieExpires(unittest.TestCase):
+
+    """Tests for morsel_to_cookie when morsel contains expires."""
+
+    def test_expires_valid_str(self):
+        """Test case where we convert expires from string time."""
+
+        morsel = Morsel()
+        morsel['expires'] = 'Thu, 01-Jan-1970 00:00:01 GMT'
+        cookie = morsel_to_cookie(morsel)
+        assert cookie.expires == 1
+
+    def test_expires_invalid_int(self):
+        """Test case where an invalid type is passed for expires."""
+
+        morsel = Morsel()
+        morsel['expires'] = 100
+        with pytest.raises(TypeError):
+            morsel_to_cookie(morsel)
+
+    def test_expires_invalid_str(self):
+        """Test case where an invalid string is input."""
+
+        morsel = Morsel()
+        morsel['expires'] = 'woops'
+        with pytest.raises(ValueError):
+            morsel_to_cookie(morsel)
+
+    def test_expires_none(self):
+        """Test case where expires is None."""
+
+        morsel = Morsel()
+        morsel['expires'] = None
+        cookie = morsel_to_cookie(morsel)
+        assert cookie.expires is None
+
+
+class TestMorselToCookieMaxAge(unittest.TestCase):
+
+    """Tests for morsel_to_cookie when morsel contains max-age."""
+
+    def test_max_age_valid_int(self):
+        """Test case where a valid max age in seconds is passed."""
+
+        morsel = Morsel()
+        morsel['max-age'] = 60
+        cookie = morsel_to_cookie(morsel)
+        assert isinstance(cookie.expires, int)
+
+    def test_max_age_invalid_str(self):
+        """Test case where a invalid max age is passed."""
+
+        morsel = Morsel()
+        morsel['max-age'] = 'woops'
+        with pytest.raises(TypeError):
+            morsel_to_cookie(morsel)
+
 
 if __name__ == '__main__':
     unittest.main()
